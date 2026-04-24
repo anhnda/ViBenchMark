@@ -72,41 +72,6 @@ def normalise_vi(text: str) -> str:
 # Load parquet trực tiếp — không qua HF audio decode
 # ---------------------------------------------------------------------------
 
-def list_parquet_urls(split: str) -> list[str]:
-    """Lấy danh sách URL parquet files từ HuggingFace Hub."""
-    from huggingface_hub import HfFileSystem
-    fs = HfFileSystem()
-    pattern = f"datasets/{HF_REPO}/data/{split}-*.parquet"
-    files = fs.glob(pattern)
-    urls = [
-        "https://huggingface.co/datasets/{}/resolve/main/{}".format(
-            HF_REPO, f.split(f"{HF_REPO}/")[-1]
-        )
-        for f in sorted(files)
-    ]
-    print(f"   Found {len(urls)} parquet file(s) for [{split}]")
-    return urls
-
-
-def iter_parquet_rows(urls: list[str]):
-    """
-    Đọc từng parquet file qua HTTP bằng pandas.
-    KHÔNG gọi HF datasets → không cần torchcodec.
-    Audio column là dict {"bytes": b"...", "path": "..."}.
-    """
-    import pandas as pd
-
-    for url in urls:
-        fname = url.split("/")[-1]
-        try:
-            df = pd.read_parquet(url, storage_options={"anon": True})
-        except Exception as e:
-            print(f"   ⚠️  Skip {fname}: {e}")
-            continue
-        print(f"   📄 {fname}: {len(df)} rows")
-        for _, row in df.iterrows():
-            yield row.to_dict()
-
 
 def collect_samples(
     split: str,
@@ -115,30 +80,36 @@ def collect_samples(
     exclude_transcripts: set = None,
     buffer_multiplier: int = 5,
 ) -> list[dict]:
-    """Thu thập n_target samples từ BUD500 split."""
+    """
+    Thu thập n_target samples từ BUD500 split.
+
+    Trick tắt torchcodec: cast cột audio sang {"bytes": Value("binary")}
+    TRƯỚC khi iterate. HF streaming sẽ chỉ trả raw bytes, không decode.
+    Sau đó ta tự decode bằng soundfile.
+    """
+    from datasets import load_dataset, Value
 
     if exclude_transcripts is None:
         exclude_transcripts = set()
 
     buffer_size = min(n_target * buffer_multiplier, 6000)
-    urls = list_parquet_urls(split)
 
-    print(f"   Target buffer: {buffer_size} samples...")
+    print(f"   Streaming BUD500 [{split}] (auto-decode OFF)...")
+    ds = load_dataset(HF_REPO, split=split, streaming=True)
+
+    # Cast audio column → tắt auto-decode hoàn toàn, chỉ giữ raw bytes
+    ds = ds.cast_column("audio", {"bytes": Value("binary"), "path": Value("string")})
+
     buffer = []
     pbar = tqdm(total=buffer_size, desc=f"   [{split}]", unit="utt")
 
-    for row in iter_parquet_rows(urls):
-        transcript = str(row.get("transcription", "")).strip()
+    for item in ds:
+        transcript = str(item.get("transcription", "")).strip()
         if not transcript or transcript in exclude_transcripts:
             continue
 
-        # Audio field: dict với key "bytes"
-        audio_field = row.get("audio", {})
-        raw_bytes = (
-            audio_field.get("bytes")
-            if isinstance(audio_field, dict)
-            else None
-        )
+        audio_field = item.get("audio", {})
+        raw_bytes = audio_field.get("bytes") if isinstance(audio_field, dict) else None
         if not raw_bytes:
             continue
 
