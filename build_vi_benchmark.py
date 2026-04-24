@@ -119,29 +119,48 @@ def is_quality_paragraph(para: str, min_chars: int = 150) -> bool:
 # Dataset loaders
 # ---------------------------------------------------------------------------
 
+"""
+PATCH: Thay thế hai hàm loader trong build_vi_benchmark.py
+Lý do: datasets >= 2.20 không còn hỗ trợ loading script (wikipedia.py, cc100.py).
+       Phải dùng các repo Parquet-native trên Hugging Face.
+
+Nguồn thay thế:
+  Primary  : wikimedia/wikipedia  20231101.vi   (Parquet-native, ~1.5GB)
+  Fallback1: uonlp/CulturaX       vi            (Parquet-native, ~8GB stream)
+  Fallback2: mc4                  vi            (Parquet-native, stream)
+"""
+
+# =====================================================================
+# DÁN ĐÈ hai hàm này vào build_vi_benchmark.py
+# =====================================================================
+
 def collect_from_wikipedia_vi(target_chars: int, seed: int = 42) -> list[str]:
     """
-    Thu thập văn bản từ Wikipedia tiếng Việt (20231101.vi).
-    Trả về list các đoạn văn sạch đã lọc.
+    Thu thập văn bản từ Wikipedia tiếng Việt.
+    Dùng 'wikimedia/wikipedia' — repo Parquet-native chính thức,
+    thay thế cho 'wikipedia' (dùng loading script, không còn hỗ trợ).
     """
-    print("\n📚 Loading Wikipedia tiếng Việt (20231101.vi)...")
-    print("   (Lần đầu sẽ tải ~1.5GB — sau đó cache tự động)")
+    print("\n📚 Loading Wikipedia tiếng Việt (wikimedia/wikipedia 20231101.vi)...")
+    print("   (Lần đầu tải ~1.5GB, sau đó cache tự động)")
 
     try:
+        from datasets import load_dataset
         ds = load_dataset(
-            "wikipedia",
+            "wikimedia/wikipedia",
             "20231101.vi",
             split="train",
-            trust_remote_code=True,
+            # KHÔNG dùng trust_remote_code — đây là Parquet-native
         )
     except Exception as e:
-        print(f"   ⚠️  Lỗi tải Wikipedia vi: {e}")
+        print(f"   ⚠️  Lỗi tải wikimedia/wikipedia: {e}")
         return []
 
+    import random
     rng = random.Random(seed)
     indices = list(range(len(ds)))
     rng.shuffle(indices)
 
+    from tqdm import tqdm
     paragraphs = []
     collected_chars = 0
 
@@ -150,7 +169,6 @@ def collect_from_wikipedia_vi(target_chars: int, seed: int = 42) -> list[str]:
         article = ds[idx]
         text = clean_wiki_text(article.get("text", ""))
 
-        # Tách thành đoạn văn
         paras = [p.strip() for p in text.split("\n\n") if p.strip()]
         for para in paras:
             if is_quality_paragraph(para):
@@ -159,35 +177,74 @@ def collect_from_wikipedia_vi(target_chars: int, seed: int = 42) -> list[str]:
 
         pbar.set_postfix({"chars": f"{collected_chars/1e6:.2f}M", "paras": len(paragraphs)})
 
-        if collected_chars >= target_chars * 1.2:   # dư 20% để có đủ sau khi lọc split
+        if collected_chars >= target_chars * 1.2:
             break
 
-    print(f"   ✅ Thu thập {len(paragraphs):,} đoạn văn ({collected_chars/1e6:.2f}M ký tự)")
+    print(f"   ✅ {len(paragraphs):,} đoạn văn ({collected_chars/1e6:.2f}M ký tự)")
     return paragraphs
 
 
 def collect_from_cc100_vi(target_chars: int, seed: int = 42) -> list[str]:
-    """Fallback: CC-100 tiếng Việt."""
-    print("\n📚 Fallback: Loading CC-100 tiếng Việt...")
+    """
+    Fallback 1: CulturaX tiếng Việt (uonlp/CulturaX) — Parquet-native.
+    Thay thế cho 'cc100' (dùng loading script, không còn hỗ trợ).
+
+    Nếu CulturaX cũng thất bại, thử tiếp mc4 tiếng Việt.
+    """
+    from datasets import load_dataset
+    from tqdm import tqdm
+
+    # --- Thử CulturaX trước ---
+    print("\n📚 Fallback 1: Loading CulturaX tiếng Việt (uonlp/CulturaX vi)...")
     try:
-        ds = load_dataset("cc100", lang="vi", split="train", streaming=True, trust_remote_code=True)
+        ds = load_dataset(
+            "uonlp/CulturaX",
+            "vi",
+            split="train",
+            streaming=True,
+        )
+        paragraphs = []
+        collected_chars = 0
+        for item in tqdm(ds, desc="   CulturaX vi", unit="doc"):
+            text = item.get("text", "").strip()
+            if is_quality_paragraph(text, min_chars=200):
+                paragraphs.append(text)
+                collected_chars += len(text)
+            if collected_chars >= target_chars * 1.2:
+                break
+
+        if paragraphs:
+            print(f"   ✅ CulturaX: {len(paragraphs):,} đoạn ({collected_chars/1e6:.2f}M ký tự)")
+            return paragraphs
+
     except Exception as e:
-        print(f"   ⚠️  Lỗi tải CC-100: {e}")
+        print(f"   ⚠️  Lỗi CulturaX: {e}")
+
+    # --- Fallback 2: mc4 ---
+    print("\n📚 Fallback 2: Loading mc4 tiếng Việt (allenai/c4 vi)...")
+    try:
+        ds = load_dataset(
+            "allenai/c4",
+            "vi",            # subset tiếng Việt của C4 (Parquet-native)
+            split="train",
+            streaming=True,
+        )
+        paragraphs = []
+        collected_chars = 0
+        for item in tqdm(ds, desc="   C4 vi", unit="doc"):
+            text = item.get("text", "").strip()
+            if is_quality_paragraph(text, min_chars=200):
+                paragraphs.append(text)
+                collected_chars += len(text)
+            if collected_chars >= target_chars * 1.2:
+                break
+
+        print(f"   ✅ C4-vi: {len(paragraphs):,} đoạn ({collected_chars/1e6:.2f}M ký tự)")
+        return paragraphs
+
+    except Exception as e:
+        print(f"   ⚠️  Lỗi C4-vi: {e}")
         return []
-
-    paragraphs = []
-    collected_chars = 0
-    for item in tqdm(ds, desc="   CC-100 vi", unit="doc"):
-        text = item.get("text", "").strip()
-        if is_quality_paragraph(text, min_chars=200):
-            paragraphs.append(text)
-            collected_chars += len(text)
-        if collected_chars >= target_chars * 1.2:
-            break
-
-    print(f"   ✅ CC-100: {len(paragraphs):,} đoạn ({collected_chars/1e6:.2f}M ký tự)")
-    return paragraphs
-
 
 # ---------------------------------------------------------------------------
 # Stream builder — giống WikiText: ghép thành 1 dòng stream liên tục
